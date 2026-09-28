@@ -1,3 +1,11 @@
+这个项目是个 Fork !
+
+改造为 OpenGL 了
+
+原作者 README
+
+---
+
 基于 EasyX 图形库开发的 3D 软件渲染引擎。
 
 A 3D software rendering engine developed based on the EasyX graphics library. 

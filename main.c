@@ -2019,6 +2019,7 @@ static void osd_draw(const Osd* o) {
     ROW("V fly   F fov   R osd   F9 path   F10 scale");
     ROW("F11 fullscreen   F12 dpisupport   ALT or MMB release cursor");
     ROW("ESC quit");
+    ROW("Vsync %s", getvsync() ? "On" : "Off");
 
 #undef ROW
 

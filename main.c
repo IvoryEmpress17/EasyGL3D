@@ -26,6 +26,7 @@
  *            V   fly on / off        (was F: F is the FOV dialog now)
  *            F   field of view -- opens an InputBox, degrees, 25..120
  *            R   OSD on / off
+ *            F8  MSAA: cycle 4x -> 8x -> off -> 2x  (GPU mesh path only)
  *            F9  force the software rasteriser (compare the two paths)
  *            F10 cycle the render scale 100% -> 75% -> 50%  (software path)
  *            F11 high DPI scaling on / off (fixhighdpi)
@@ -134,6 +135,7 @@ static const float RR_SCALE[RR_SCALE_STEPS] = { 1.0f, 0.75f, 0.5f };
 #define RRK_F       0x46
 #define RRK_R       0x52
 #define RRK_V       0x56
+#define RRK_F8      0x77
 #define RRK_F9      0x78
 #define RRK_F10     0x79
 #define RRK_F11     0x7A
@@ -1523,6 +1525,40 @@ static void gpumesh_free(void) {
     g_meshReady = 0;
 }
 
+/* 7d. MSAA (F8)                                                       */
+/* ------------------------------------------------------------------ */
+/* Sample counts cycled by F8, index g_aaStep into RR_AA.  0 turns it off.
+ *
+ * Two things are worth knowing before pressing it.
+ *
+ * First, MSAA only smooths the edges of REAL GEOMETRY.  The software
+ * rasteriser has none: it writes finished pixels into a buffer that is then
+ * blitted, and there is no edge for the hardware to resolve anywhere in that
+ * path.  So F8 does nothing visible while F9 has forced the CPU -- it is
+ * not broken, it is the wrong path.  What it does still affect on either
+ * path is the canvas itself, which is what smooths the crosshair and the
+ * OSD text.
+ *
+ * Second, what is asked for is not always what is used.  The 3D target
+ * walks 8 -> 4 -> 2 the same way the canvas does, because there is no query
+ * for "which counts this driver accepts": an unsupported one simply leaves
+ * the framebuffer incomplete.  getmeshsamples() reports what was actually
+ * built, and that is the number the OSD shows.                           */
+
+#define RR_AA_STEPS   4
+static const int RR_AA[RR_AA_STEPS] = { 0, 2, 4, 8 };
+static int g_aaStep = 2;            /* index into RR_AA: start at 4x     */
+
+/* safe to call before initgraph() - it takes effect once GL is up */
+static void rr_aa_apply(void) {
+    int want = RR_AA[g_aaStep];
+    setaasamples(want);
+    /* getmeshsamples() reads 0 at start up: the 3D target does not exist
+     * until the first meshbegin().  The OSD shows the settled value.     */
+    fprintf(stderr, "voxelgl: MSAA requested %d (canvas %d)\n",
+            want, getaasamples());
+}
+
 /* M4 here is row major (m[row*4+col]); OpenGL wants column major. */
 static void m4_to_colmajor(const M4* m, float out[16]) {
     for (int r = 0; r < 4; r++)
@@ -1744,7 +1780,12 @@ int main(void) {
         t[2].x =  0.0f; t[2].y =  0.5f; t[2].w = 1.0f; t[2].v = 512.0f;
         int before = g_pix;
         raster_tri(t, 256, 1);
-        printf("SELFTEST centre triangle: pix=%d (expect ~115200)\n", g_pix - before);
+        /* One eighth of the frame buffer: the triangle is a right angled
+         * half of a square that spans the middle half of both axes.  It is
+         * RR_W*RR_H/8, so the number moves with the canvas -- 115200 at
+         * 1280x720, 76800 at the current 960x640.                        */
+        printf("SELFTEST centre triangle: pix=%d (expect ~%d)\n",
+               g_pix - before, g_fb.w * g_fb.h / 8);
         g_pix = before;
     }
 
@@ -1974,6 +2015,7 @@ typedef struct Osd {
     const char* under;      /* block stood on                              */
     const char* look;       /* block under the crosshair                   */
     float  lookDist;
+    int    aaReq, aaGot;      /* requested samples, and what was built    */
     int    faces, raster, pix, chunkIn, chunkOut, backface, behind, farout;
     int    meshN, chunks;
 } Osd;
@@ -1998,6 +2040,13 @@ static void osd_draw(const Osd* o) {
         o->logW, o->logH, (double)(o->dpi * 100.0f),
         o->fullscreen ? "fullscreen" : "windowed");
     ROW("fov %.1f deg vertical   %.1f horizontal   [F]", o->fovV, o->fovH);
+    if (o->aaReq == 0)
+        ROW("msaa   off   [F8]");
+    else if (o->usedGpu)
+        ROW("msaa   x%d asked, x%d on the mesh target   [F8]", o->aaReq, o->aaGot);
+    else
+        ROW("msaa   x%d, canvas only -- no geometry to resolve here   [F8]",
+            o->aaReq);
     ROW(" ");
     ROW("pos  %.2f  %.2f  %.2f", o->x, o->y, o->z);
     ROW("look yaw %7.1f  pitch %6.1f   %s", o->yaw, o->pitch, o->compass);
@@ -2016,7 +2065,7 @@ static void osd_draw(const Osd* o) {
     ROW("world  %d faces   %d chunks", o->meshN, o->chunks);
     ROW(" ");
     ROW("WASD move   SPACE jump   SHIFT sneak   CTRL sprint");
-    ROW("V fly   F fov   R osd   F9 path   F10 scale");
+    ROW("V fly   F fov   R osd   F8 msaa   F9 path   F10 scale");
     ROW("F11 fullscreen   F12 dpisupport   ALT or MMB release cursor");
     ROW("ESC quit");
     ROW("Vsync %s", getvsync() ? "On" : "Off");
@@ -2251,6 +2300,13 @@ int main(void) {
      * frame for data that is thrown away.  Skip it.                      */
     setimagebuffermode(GX_IMGBUF_DISCARD);
 
+    /* Anti aliasing.  After initgraph(), because setaasamples() rebuilds
+     * the canvas framebuffer and there is none until the GL context is up;
+     * and before the first meshbegin(), because that is the moment the 3D
+     * target is built and it takes the count that is current then.  F8
+     * cycles it at run time and the target follows on the next frame.    */
+    rr_aa_apply();
+
     /* Fold the system DPI into the coordinate space: from here on the window
      * is RR_W x RR_H LOGICAL units but RR_W*scale x RR_H*scale real pixels,
      * so it is the same physical size on every display and the software
@@ -2426,6 +2482,14 @@ int main(void) {
                         lockValid = 0;           /* the pointer moved      */
                         clipW = clipH = -1;      /* force a re-clip        */
                         break;
+                    case RRK_F8:
+                        /* MSAA.  Rebuilding the canvas framebuffer and the
+                         * 3D target costs a hitch on this one frame and
+                         * nothing after it; the target is only recreated
+                         * when the count actually changes.                */
+                        g_aaStep = (g_aaStep + 1) % RR_AA_STEPS;
+                        rr_aa_apply();
+                        break;
                     case RRK_F9:  g_forceCpu = !g_forceCpu; break;
                     case RRK_F10:
                         g_scaleStep = (g_scaleStep + 1) % RR_SCALE_STEPS;
@@ -2555,6 +2619,10 @@ int main(void) {
             o.rw       = g_fb.color ? g_fb.w : g_devW;
             o.rh       = g_fb.color ? g_fb.h : g_devH;
             o.fovV     = g_fovDeg;
+            o.aaReq    = getaasamples();
+            /* 0 until the first meshbegin(): that is when the 3D target is
+             * built, and it is the only thing that reports a real count. */
+            o.aaGot    = getmeshsamples();
             {
                 /* aspect is the same in either space: the DPI scale is
                  * uniform on both axes.                                  */
@@ -2623,4 +2691,5 @@ done:
 }
 
 #endif
+
 

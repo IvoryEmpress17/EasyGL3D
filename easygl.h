@@ -10038,7 +10038,14 @@ typedef struct GXMESH {
 static GLuint g_gx_gmProg = 0;
 static GLint  g_gx_gmUmvp = -1, g_gx_gmUtex = -1, g_gx_gmUuseTex = -1, g_gx_gmUflip = -1;
 static GLint  g_gx_gmUeye = -1, g_gx_gmUfog = -1, g_gx_gmUfogCol = -1;
+/* g_gx_gmFbo is where geometry is rasterised.  With MSAA on it owns two
+ * multisampled RENDERBUFFERs and g_gx_gmFboR is the single sample FBO that
+ * holds g_gx_gmTex; meshend() resolves into it before compositing.  With
+ * MSAA off g_gx_gmFbo attaches g_gx_gmTex directly and g_gx_gmFboR is 0,
+ * which is exactly what this used to do. */
 static GLuint g_gx_gmFbo = 0, g_gx_gmTex = 0, g_gx_gmRb = 0, g_gx_gmQuad = 0;
+static GLuint g_gx_gmFboR = 0, g_gx_gmRbC = 0;
+static int    g_gx_gmSamples = 0;         /* samples the target was built with */
 static int    g_gx_gmW = 0, g_gx_gmH = 0;
 static int    g_gx_gmTried = 0, g_gx_gmOk = 0;
 static GLuint g_gx_gmQuadVao = 0;         /* the composite quad's own VAO     */
@@ -10229,18 +10236,55 @@ static int gxmesh_setup(void) {
     return 1;
 }
 
-/* The offscreen target is rebuilt whenever the canvas changes size.  It
- * needs a depth attachment because the canvas framebuffer has none. */
-static int gxmesh_target(int w, int h) {
-    if (w < 1 || h < 1) return 0;
-    if (g_gx_gmFbo && w == g_gx_gmW && h == g_gx_gmH) return 1;
+static void gxmesh_target_free(void) {
+    if (g_gx_gmFboR) { glDeleteFramebuffers(1, &g_gx_gmFboR); g_gx_gmFboR = 0; }
+    if (g_gx_gmFbo)  { glDeleteFramebuffers(1, &g_gx_gmFbo);  g_gx_gmFbo  = 0; }
+    if (g_gx_gmRbC)  { glDeleteRenderbuffers(1, &g_gx_gmRbC); g_gx_gmRbC  = 0; }
+    if (g_gx_gmRb)   { glDeleteRenderbuffers(1, &g_gx_gmRb);  g_gx_gmRb   = 0; }
+    if (g_gx_gmTex)  { glDeleteTextures(1, &g_gx_gmTex);      g_gx_gmTex  = 0; }
+}
 
-    if (g_gx_gmFbo) {
-        glDeleteFramebuffers(1, &g_gx_gmFbo);
-        glDeleteTextures(1, &g_gx_gmTex);
-        glDeleteRenderbuffers(1, &g_gx_gmRb);
-        g_gx_gmFbo = g_gx_gmTex = g_gx_gmRb = 0;
+/* Depth attachment: 24 bit first, 16 is the fall back an old driver may
+ * insist on.  samples >= 2 asks for a multisampled one, which it has to
+ * be whenever the colour attachment is: GL refuses a framebuffer that
+ * mixes multisampled and single sampled attachments. */
+static int gxmesh_depth(int w, int h, int samples) {
+    static const GLenum fmts[2] = { GL_DEPTH_COMPONENT24, GL_DEPTH_COMPONENT16 };
+    int i;
+    if (g_gx_gmRb) { glDeleteRenderbuffers(1, &g_gx_gmRb); g_gx_gmRb = 0; }
+    glGenRenderbuffers(1, &g_gx_gmRb);
+    glBindRenderbuffer(GL_RENDERBUFFER, g_gx_gmRb);
+    for (i = 0; i < 2; i++) {
+        if (samples >= 2 && glRenderbufferStorageMultisample)
+            glRenderbufferStorageMultisample(GL_RENDERBUFFER, (GLsizei)samples,
+                                             fmts[i], (GLsizei)w, (GLsizei)h);
+        else
+            glRenderbufferStorage(GL_RENDERBUFFER, fmts[i], (GLsizei)w, (GLsizei)h);
+        if (glGetError() == GL_NO_ERROR) return 1;
     }
+    return 0;
+}
+
+/* The offscreen target is rebuilt whenever the canvas changes size or the
+ * requested sample count does.  It needs a depth attachment because the
+ * canvas framebuffer has none.
+ *
+ * setaasamples() used to have no effect on this pass at all: the geometry
+ * never touched the canvas framebuffer, which is the only one MSAA was
+ * ever applied to.  With samples >= 2 the target becomes two multisampled
+ * renderbuffers plus g_gx_gmFboR, the single sample FBO that meshend()
+ * resolves into.  With 0 it is the one FBO with the texture attached,
+ * exactly as before. */
+static int gxmesh_target(int w, int h) {
+    int want, s;
+    if (w < 1 || h < 1) return 0;
+    want = (g_gx_aaSamples >= 2 && glRenderbufferStorageMultisample && glBlitFramebuffer)
+           ? g_gx_aaSamples : 0;
+    if (g_gx_gmFbo && w == g_gx_gmW && h == g_gx_gmH && want == g_gx_gmSamples) return 1;
+
+    gxmesh_target_free();
+    /* meshend() always samples g_gx_gmTex, so it exists either way: with
+     * MSAA on it is the resolve destination rather than the draw target. */
     glGenTextures(1, &g_gx_gmTex);
     glBindTexture(GL_TEXTURE_2D, g_gx_gmTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -10248,33 +10292,57 @@ static int gxmesh_target(int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP);
+    glBindTexture(GL_TEXTURE_2D, 0);
 
-    glGenRenderbuffers(1, &g_gx_gmRb);
-    glBindRenderbuffer(GL_RENDERBUFFER, g_gx_gmRb);
-    /* 24 bit depth first; 16 is the fall back an old driver may insist on */
-    glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, w, h);
-    if (glGetError() != GL_NO_ERROR) {
-        glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, w, h);
-        if (glGetError() != GL_NO_ERROR) {
-            glBindRenderbuffer(GL_RENDERBUFFER, 0);
-            glBindTexture(GL_TEXTURE_2D, 0);
-            return 0;
+    /* No query for "which counts work": an unsupported one leaves the
+     * framebuffer incomplete, so walk down 4 -> 2 like the canvas does. */
+    for (s = want; s >= 2; s /= 2) {
+        GLuint rbC = 0;
+        glGenRenderbuffers(1, &rbC);
+        glBindRenderbuffer(GL_RENDERBUFFER, rbC);
+        glRenderbufferStorageMultisample(GL_RENDERBUFFER, (GLsizei)s, GL_RGBA8,
+                                         (GLsizei)w, (GLsizei)h);
+        if (glGetError() == GL_NO_ERROR && gxmesh_depth(w, h, s)) {
+            glGenFramebuffers(1, &g_gx_gmFbo);
+            glBindFramebuffer(GL_FRAMEBUFFER, g_gx_gmFbo);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                      GL_RENDERBUFFER, rbC);
+            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                                      GL_RENDERBUFFER, g_gx_gmRb);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                g_gx_gmRbC = rbC;
+                glGenFramebuffers(1, &g_gx_gmFboR);
+                glBindFramebuffer(GL_FRAMEBUFFER, g_gx_gmFboR);
+                glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                       GL_TEXTURE_2D, g_gx_gmTex, 0);
+                if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+                    glBindRenderbuffer(GL_RENDERBUFFER, 0);
+                    g_gx_gmSamples = s; g_gx_gmW = w; g_gx_gmH = h;
+                    return 1;
+                }
+            }
         }
+        /* this count did not take: drop it and try half as many */
+        if (rbC) glDeleteRenderbuffers(1, &rbC);
+        if (g_gx_gmFboR) { glDeleteFramebuffers(1, &g_gx_gmFboR); g_gx_gmFboR = 0; }
+        if (g_gx_gmFbo)  { glDeleteFramebuffers(1, &g_gx_gmFbo);  g_gx_gmFbo  = 0; }
+        if (g_gx_gmRb)   { glDeleteRenderbuffers(1, &g_gx_gmRb);  g_gx_gmRb   = 0; }
     }
+
+    /* MSAA off, or the driver refused every count: one FBO, texture drawn
+     * straight into it. */
+    if (!gxmesh_depth(w, h, 0)) { gxmesh_target_free(); return 0; }
     glGenFramebuffers(1, &g_gx_gmFbo);
     glBindFramebuffer(GL_FRAMEBUFFER, g_gx_gmFbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_gx_gmTex, 0);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, g_gx_gmRb);
     if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
-        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-        glBindRenderbuffer(GL_RENDERBUFFER, 0);
-        glBindTexture(GL_TEXTURE_2D, 0);
-        return 0;
+        gxmesh_target_free(); return 0;
     }
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     glBindRenderbuffer(GL_RENDERBUFFER, 0);
-    glBindTexture(GL_TEXTURE_2D, 0);
-    g_gx_gmW = w; g_gx_gmH = h;
+    g_gx_gmSamples = 0; g_gx_gmW = w; g_gx_gmH = h;
     return 1;
 }
 
@@ -10461,6 +10529,17 @@ GX_INLINE void gxmeshdraw(GXMESH* m, const float* mvp16, IMAGE* tex) {
 
 GX_INLINE void gxmeshend(void) {
     if (!g_gx_gmIn) return;
+    /* Fold the samples into g_gx_gmTex before it is used as a texture.
+     * Averaging is what the resolve is for: an edge pixel that was half
+     * covered comes out half transparent, which is exactly what the
+     * composite below wants. */
+    if (g_gx_gmFboR) {
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, g_gx_gmFbo);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, g_gx_gmFboR);
+        glBlitFramebuffer(0, 0, g_gx_gmW, g_gx_gmH, 0, 0, g_gx_gmW, g_gx_gmH,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
     glBindFramebuffer(GL_FRAMEBUFFER, g_gx_canvasTarget.fbo);
     glViewport(0, 0, g_gx_canvasTarget.w, g_gx_canvasTarget.h);
     glDisable(GL_DEPTH_TEST);
@@ -10581,6 +10660,10 @@ GX_INLINE void meshfog(float nearD, float farD, COLORREF col) {
 }
 GX_INLINE void mesheye(float x, float y, float z) { gxmesheye(x, y, z); }
 GX_INLINE void meshflip(bool on) { gxmeshflip(on ? 1 : 0); }
+/* Samples the 3D target was actually built with: 0 when MSAA is off or the
+ * driver refused it.  Can be lower than getaasamples() because the target
+ * walks 4 -> 2 the same way the canvas does. */
+GX_INLINE int getmeshsamples(void) { return g_gx_gmSamples; }
 
 GX_INLINE void meshperspective(float out[16], float fovyRad, float aspect,
                                float nearZ, float farZ) {

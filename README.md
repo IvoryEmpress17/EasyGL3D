@@ -1,6 +1,8 @@
 这个项目是个 Fork !
 
-改造为 OpenGL 了
+改造为 [EasyGL](https://github.com/IvoryEmpress17/EasyGL_on_OpenGL) 了
+
+体验GPU超强性能
 
 原作者 README
 

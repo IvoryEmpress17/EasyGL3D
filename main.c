@@ -23,6 +23,8 @@
  *   Nothing floats either: the four hand placed sky blocks are gone.
  *
  * Controls:  WASD move, SPACE jump, SHIFT sneak, CTRL sprint, ESC quit
+ *            Sneaking does two things: it slows you down and it refuses to
+ *            let you walk off a ledge.  See the ledge guard in 6b.
  *            V   fly on / off        (was F: F is the FOV dialog now)
  *            F   field of view -- opens an InputBox, degrees, 25..120
  *            R   OSD on / off
@@ -1067,6 +1069,8 @@ typedef struct Camera {
     int   onGround;
     int   fly;
     int   sneak;
+    int   edgeHold;    /* set for one frame when the ledge guard refused
+                        * a step; the OSD reads it                        */
 } Camera;
 
 static Camera g_cam;
@@ -1093,6 +1097,87 @@ static void cam_look(Camera* c, float dx, float dy) {
     if (c->pitch < -LIM) c->pitch = -LIM;
     if (c->yaw >  3.14159265f) c->yaw -= 6.28318531f;
     if (c->yaw < -3.14159265f) c->yaw += 6.28318531f;
+}
+
+/* Is there a block under the player's FEET at this horizontal position?
+ *
+ * The carrying block is the one just below, and 0.2 is the offset
+ * block_under_camera() already uses: standing on top of block 4 means
+ * pos.y == 5.0, and floorf(5.0 - 0.2) == 4, which is the block being stood
+ * on.  The same expression still lands on 4 when gravity has pulled the
+ * player a fraction below the surface, so the answer does not flicker as
+ * he settles.
+ *
+ * It is a FOOTPRINT, not the single point under the centre, because that is
+ * what makes the result feel right.  Minecraft's player is 0.6 wide and
+ * stays put while any part of that box is still over a block -- you can
+ * stand with your toes over the void, and you can also slide along a ledge
+ * because the guard is applied one axis at a time.  Testing the centre
+ * alone would stop you a third of a block too early and would turn every
+ * corner into a dead stop instead of a slide.                            */
+#define RR_FOOT_HALF 0.3f
+
+/* The five columns the footprint covers: the centre plus the four corners
+ * of the 0.6-wide box.  Shared by the guard and by the landing test so the
+ * two can never disagree about where the ground is.                      */
+static const float RR_FOOT_OX[5] = { 0.0f, -RR_FOOT_HALF,  RR_FOOT_HALF,
+                                           -RR_FOOT_HALF,  RR_FOOT_HALF };
+static const float RR_FOOT_OZ[5] = { 0.0f, -RR_FOOT_HALF, -RR_FOOT_HALF,
+                                            RR_FOOT_HALF,  RR_FOOT_HALF };
+
+/* Height of the surface the footprint would rest on, or -1e30f when no
+ * column under the player holds a block at all.
+ *
+ * The search STARTS AT THE HEIGHT HE IS AT NOW, before this frame's fall,
+ * which buys two things at once.  A fast fall cannot skip the block he is
+ * falling onto: the start height is above it, so it is seen however large
+ * the step is.  And only tops at or below his feet are considered, so
+ * dropping into a well does not snap him back up to the ground beside it.
+ *
+ * "Any column", not "the column under the centre", because that is what
+ * makes standing on a ledge work: part of the box over solid ground is
+ * standing, exactly as in Minecraft.                                     */
+static float support_under(float x, float z, float y0) {
+    float best = -1e30f;
+    int ys = (int)floorf(y0 + 0.001f) - 1;
+    if (ys > WY - 1) ys = WY - 1;
+
+    for (int i = 0; i < 5; i++) {
+        int bx = (int)floorf(x + RR_FOOT_OX[i]);
+        int bz = (int)floorf(z + RR_FOOT_OZ[i]);
+        for (int yy = ys; yy >= 0; yy--)
+            if (solid(bx, yy, bz)) {
+                float top = (float)(yy + 1);
+                if (top > best) best = top;
+                break;
+            }
+    }
+    return best;
+}
+
+/* The guard's question, and it has TWO parts, not one.
+ *
+ * "Is there anything under the footprint" is not enough on its own.  Taken
+ * alone it means any ground at any depth counts, so stepping off a four
+ * block cliff onto the valley floor reads as supported and the guard waves
+ * him through -- he walks out and falls.  That is exactly what happened on
+ * real terrain, and it is invisible on a test map made of one flat shelf
+ * with nothing below it, which is why the first cut looked correct.
+ *
+ * The second half is the height: the surface has to be the one he is
+ * standing ON, not merely one somewhere underneath him.  So the test is
+ * "supported, and at or above his feet", which is also how Minecraft
+ * behaves -- sneaking refuses a step down of ANY height, one block
+ * included, because leaving the ground for even that instant is what
+ * sneaking is there to prevent.
+ *
+ * The tolerance is far below one block, so a one block drop is still
+ * refused, and it only has to absorb float noise: when standing, p.y and
+ * the surface are the same number, landing having set one from the other. */
+#define RR_LEDGE_EPS 0.05f
+static int standing_on(float x, float y, float z) {
+    float top = support_under(x, z, y);
+    return top > -1e29f && top > y - RR_LEDGE_EPS;
 }
 
 static void cam_step(Camera* c, float dt, int fwd, int back, int left, int right,
@@ -1131,26 +1216,72 @@ static void cam_step(Camera* c, float dt, int fwd, int back, int left, int right
     V3 p = c->pos;
     V3 step = vmul(c->vel, dt);
 
+    /* THE LEDGE GUARD.  Sneaking is the only mode that refuses to step off
+     * an edge, and only while actually standing on something: the rule is
+     * "a step may not END with nothing underfoot", not "you may not leave
+     * the ground".  Flying is exempt -- there is no ledge to fall off.
+     *
+     * It runs per axis and AFTER that axis' wall test, which is what turns
+     * a corner into a slide instead of a dead stop: at a corner the X half
+     * is refused and the Z half still goes through.  The velocity is left
+     * alone on purpose, so releasing SHIFT walks you off immediately
+     * instead of teleporting you forward.                                */
+    int guard = sneak && c->onGround && !c->fly;
+    c->edgeHold = 0;
+
     p.x += step.x;
-    if (solid((int)floorf(p.x + 0.3f * (step.x > 0 ? 1 : -1)), (int)floorf(p.y + 0.1f), (int)floorf(p.z)) ||
+    if (solid((int)floorf(p.x + RR_FOOT_HALF * (step.x > 0.0f ? 1.0f : -1.0f)),
+              (int)floorf(p.y + 0.1f), (int)floorf(p.z)) ||
         solid((int)floorf(p.x), (int)floorf(p.y + 0.1f), (int)floorf(p.z)))
         p.x = c->pos.x;
+    if (guard && p.x != c->pos.x && !standing_on(p.x, p.y, p.z)) {
+        p.x = c->pos.x;
+        c->edgeHold = 1;
+    }
+
     p.z += step.z;
-    if (solid((int)floorf(p.x), (int)floorf(p.y + 0.1f), (int)floorf(p.z + 0.3f * (step.z > 0 ? 1 : -1))) ||
+    if (solid((int)floorf(p.x), (int)floorf(p.y + 0.1f),
+              (int)floorf(p.z + RR_FOOT_HALF * (step.z > 0.0f ? 1.0f : -1.0f))) ||
         solid((int)floorf(p.x), (int)floorf(p.y + 0.1f), (int)floorf(p.z)))
         p.z = c->pos.z;
+    if (guard && p.z != c->pos.z && !standing_on(p.x, p.y, p.z)) {
+        p.z = c->pos.z;
+        c->edgeHold = 1;
+    }
 
     p.y += step.y;
-    int feetBlock = solid((int)floorf(p.x), (int)floorf(p.y), (int)floorf(p.z));
-    int headBlock = solid((int)floorf(p.x), (int)floorf(p.y + 1.8f), (int)floorf(p.z));
-    if (feetBlock || headBlock) {
-        p.y = c->pos.y;
-        if (step.y < 0) c->onGround = 1;
-        c->vel.y = 0;
-    } else {
-        c->onGround = 0;
-        if (p.y < 0) { p.y = 0; c->vel.y = 0; c->onGround = 1; }
+
+    /* Landing is answered by the same footprint the guard uses, and it is
+     * tried BEFORE the shove-out below.  That ordering is the whole point:
+     * the shove-out looks at the single column under the centre, so a
+     * player standing with his centre past the edge of a block reads as
+     * "in mid air" to it and is allowed to fall straight through the ledge
+     * his toes are still on.  Trying the footprint first makes him stand.
+     * It also lands him ON the surface instead of merely refusing the
+     * step, so a fast fall stops at the top rather than one step short.  */
+    int landed = 0;
+    if (step.y <= 0.0f) {
+        float top = support_under(p.x, p.z, c->pos.y);
+        if (top > -1e29f && p.y <= top) {
+            p.y = top;
+            c->vel.y = 0.0f;
+            c->onGround = 1;
+            landed = 1;
+        }
     }
+
+    if (!landed) {
+        int feetBlock = solid((int)floorf(p.x), (int)floorf(p.y), (int)floorf(p.z));
+        int headBlock = solid((int)floorf(p.x), (int)floorf(p.y + 1.8f), (int)floorf(p.z));
+        if (feetBlock || headBlock) {
+            p.y = c->pos.y;
+            if (step.y < 0) c->onGround = 1;
+            c->vel.y = 0;
+        } else {
+            c->onGround = 0;
+        }
+    }
+    if (p.y < 0.0f) { p.y = 0.0f; c->vel.y = 0.0f; c->onGround = 1; }
     c->pos = p;
 }
 
@@ -1863,6 +1994,79 @@ int main(void) {
         block_looked_at(got, sizeof(got), &d);
         printf("RAYCAST up: %s (want sky), dist %.2f (want 0)\n", got, d);
 
+        /* The ledge guard, on the ground that actually breaks it.
+         *
+         * A flat shelf with nothing beyond it is the easy case and it is
+         * not the one that fails: ask only "is there anything underfoot"
+         * and a shelf over a void is refused correctly.  Real terrain is
+         * the hard case, because there IS ground out there -- four blocks
+         * down, in the valley.  That reads as supported, so the guard steps
+         * aside and the player walks off and falls.  A one block step down
+         * fails the same way.  Hence the height comparison in standing_on,
+         * and hence a test for each of the three.                        */
+        {
+            int bad = 0;
+            /* The frames rendered further down set only yaw and pitch and
+             * inherit the position, so put it back afterwards: the walk
+             * case ends up far outside the world, and rendering from out
+             * there would produce four nearly empty frames that look like
+             * a rendering regression rather than a test that moved.     */
+            V3 savedPos = g_cam.pos;
+            const int drop[3]   = { 0, 1, 4 };      /* 0 = nothing at all  */
+            const char* nm[3]   = { "void beyond", "step down 1", "cliff drop 4" };
+            for (int s = 0; s < 3; s++) {
+                memset(g_type, 0, sizeof(g_type));
+                for (int fx = 10; fx < 21; fx++)
+                    for (int fz = 10; fz < 21; fz++)
+                        for (int fy = 0; fy < 6; fy++) g_type[fx][fy][fz] = BT_ROCK;
+                /* drop 0 means nothing out there at all, so it is skipped
+                 * rather than filled: filling it to 6-0 would make it the
+                 * same height as the shelf and turn the case into "level
+                 * ground", which is not what is being tested.           */
+                if (drop[s] > 0)
+                    for (int fx = 21; fx < 40; fx++)
+                        for (int fz = 10; fz < 21; fz++)
+                            for (int fy = 0; fy < 6 - drop[s]; fy++)
+                                g_type[fx][fy][fz] = BT_ROCK;
+
+                g_cam.pos = v3(19.0f, 6.0f, 15.5f);
+                g_cam.vel = v3(0, 0, 0);
+                g_cam.yaw = -1.5707963f;            /* facing +X           */
+                g_cam.pitch = 0.0f;
+                g_cam.onGround = 1; g_cam.fly = 0; g_cam.sneak = 0;
+                int held = 0;
+                for (int f = 0; f < 600; f++) {
+                    cam_step(&g_cam, 1.0f / 60.0f, 1, 0, 0, 0, 0, 0, 1);
+                    if (g_cam.edgeHold) held = 1;
+                }
+                int ok = (g_cam.pos.y > 5.9f) && held;
+                if (!ok) bad = 1;
+                printf("LEDGE sneak, %-12s y=%.3f hold=%d  %s\n",
+                       nm[s], g_cam.pos.y, held, ok ? "held" : "FELL");
+            }
+            /* and without SHIFT the same walk has to fall, or the guard
+             * is just a wall                                            */
+            memset(g_type, 0, sizeof(g_type));
+            for (int fx = 10; fx < 21; fx++)
+                for (int fz = 10; fz < 21; fz++)
+                    for (int fy = 0; fy < 6; fy++) g_type[fx][fy][fz] = BT_ROCK;
+            g_cam.pos = v3(19.0f, 6.0f, 15.5f);
+            g_cam.vel = v3(0, 0, 0);
+            g_cam.yaw = -1.5707963f; g_cam.pitch = 0.0f;
+            g_cam.onGround = 1; g_cam.fly = 0; g_cam.sneak = 0;
+            for (int f = 0; f < 600; f++)
+                cam_step(&g_cam, 1.0f / 60.0f, 1, 0, 0, 0, 0, 0, 0);
+            int ok = g_cam.pos.y < 1.0f;
+            if (!ok) bad = 1;
+            printf("LEDGE walk, no SHIFT     y=%.3f  %s\n",
+                   g_cam.pos.y, ok ? "fell, as it should" : "HELD, guard is a wall");
+            printf("LEDGE guard: %s\n", bad ? "FAIL" : "ok");
+
+            world_gen(); mesh_build();      /* the frames below need it    */
+            g_cam.pos = savedPos;
+            g_cam.vel = v3(0, 0, 0);
+        }
+
         /* FOV clamp keeps the projection sane at both ends               */
         printf("FOV default %.1f  clamp range %.0f..%.0f\n",
                g_fovDeg, RR_FOV_MIN, RR_FOV_MAX);
@@ -2012,6 +2216,7 @@ typedef struct Osd {
     const char* compass;
     const char* mode;       /* walk / sprint / sneak / fly                 */
     int    onGround;
+    int    edgeHold;        /* the ledge guard refused a step this frame   */
     const char* under;      /* block stood on                              */
     const char* look;       /* block under the crosshair                   */
     float  lookDist;
@@ -2050,7 +2255,11 @@ static void osd_draw(const Osd* o) {
     ROW(" ");
     ROW("pos  %.2f  %.2f  %.2f", o->x, o->y, o->z);
     ROW("look yaw %7.1f  pitch %6.1f   %s", o->yaw, o->pitch, o->compass);
-    ROW("move %s   %.2f b/s   %s", o->mode, o->speed, o->onGround ? "grounded" : "airborne");
+    if (o->edgeHold)
+        ROW("move %s   %.2f b/s   grounded   HELD AT LEDGE", o->mode, o->speed);
+    else
+        ROW("move %s   %.2f b/s   %s", o->mode, o->speed,
+            o->onGround ? "grounded" : "airborne");
     ROW("cursor %s   [ALT, or middle button]",
         o->mouseFree ? "RELEASED - free to move out" : "grabbed");
     ROW("under  %s", o->under);
@@ -2064,7 +2273,7 @@ static void osd_draw(const Osd* o) {
         o->chunkIn, o->chunkIn + o->chunkOut, o->backface, o->behind);
     ROW("world  %d faces   %d chunks", o->meshN, o->chunks);
     ROW(" ");
-    ROW("WASD move   SPACE jump   SHIFT sneak   CTRL sprint");
+    ROW("WASD move   SPACE jump   SHIFT sneak (holds ledges)   CTRL sprint");
     ROW("V fly   F fov   R osd   F8 msaa   F9 path   F10 scale");
     ROW("F11 fullscreen   F12 dpisupport   ALT or MMB release cursor");
     ROW("ESC quit");
@@ -2570,6 +2779,25 @@ int main(void) {
             continue;
         }
 
+        /* SHIFT and CTRL are re-read from the live key state every frame
+         * rather than trusted to the key stream.
+         *
+         * The stream is fine right up until it isn't: a modal dialog, an
+         * alt-tab, or a window that loses focus mid-press can eat the keyup,
+         * and then the flag stays set for the rest of the run -- the player
+         * creeps along at sneak speed with no key down and no way to tell
+         * why.  Anything that swallowed the keydown has the same effect the
+         * other way round: the ledge guard silently does nothing, which
+         * looks exactly like the guard being broken.
+         *
+         * GetAsyncKeyState() is the physical key, so it cannot get out of
+         * step.  It is only consulted while this window is the foreground
+         * one, so a Shift held in some other window does not sneak.       */
+        if (wantLock) {
+            sneak  = (GetAsyncKeyState(RRK_SHIFT) & 0x8000) != 0;
+            sprint = (GetAsyncKeyState(RRK_CTRL)  & 0x8000) != 0;
+        }
+
         /* timing */
         double now = (double)clock() / CLOCKS_PER_SEC;
         float dt = have_last ? (float)(now - last) : 1.0f / 60.0f;
@@ -2638,6 +2866,7 @@ int main(void) {
             o.mode    = g_cam.fly ? "fly"
                       : (sprint ? "sprint" : (sneak ? "sneak" : "walk"));
             o.onGround = g_cam.onGround;
+            o.edgeHold = g_cam.edgeHold;
             block_under_camera(blk, sizeof(blk));
             o.under = blk;
             block_looked_at(look, sizeof(look), &o.lookDist);

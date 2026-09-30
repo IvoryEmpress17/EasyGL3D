@@ -1,5 +1,5 @@
 #ifndef EASYGL_H
-#define EASYGL_H 20260927
+#define EASYGL_H 20260930
 
 /* =====================================================================
  * easygl.h - EasyX compatible drawing library implemented on OpenGL.
@@ -413,8 +413,8 @@
  * byte, a setalpha() level, a window opacity - is a transparency.
  */
 
-#define EASYGL_VER      20260927
-#define EASYGL_VERSION  "20260927"
+#define EASYGL_VER      20260930
+#define EASYGL_VERSION  "20260930"
 
 #ifndef _CRT_SECURE_NO_WARNINGS
 #define _CRT_SECURE_NO_WARNINGS 1
